@@ -33,6 +33,7 @@ class AsyncFetcher:
         self.max_clients = max_clients
         self.session: Optional[AsyncSession] = None
         self._laodong_cookies: Optional[str] = None
+        self._pubmed_cookies: Optional[str] = None
 
     async def __aenter__(self):
         await self.start()
@@ -72,6 +73,11 @@ class AsyncFetcher:
         if domain == "laodong.vn" and self._laodong_cookies:
             custom_headers["Cookie"] = self._laodong_cookies
 
+        # Xử lý cookie riêng nếu có sẵn cho PubMed
+        is_pubmed = "pubmed.ncbi.nlm.nih.gov" in domain or "ncbi.nlm.nih.gov" in domain
+        if is_pubmed and self._pubmed_cookies:
+            custom_headers["Cookie"] = self._pubmed_cookies
+
         for attempt in range(self.max_retries + 1):
             try:
                 resp = await self.session.get(url, headers=custom_headers if custom_headers else None)
@@ -86,6 +92,41 @@ class AsyncFetcher:
                         retry_headers = {"Cookie": d1n_cookie}
                         retry_resp = await self.session.get(url, headers=retry_headers)
                         return retry_resp.status_code, retry_resp.text or "", None
+
+                # Kiểm tra thử thách PoW của PubMed/NCBI (HTTP 203 hoặc có PoW challenge script)
+                if (status_code == 203 or is_pubmed) and "challengeId" in html and "_pow/solve" in html:
+                    pow_res = DomainHandlerRegistry.solve_ncbi_pow(html)
+                    if pow_res:
+                        challenge_id, nonce = pow_res
+                        solve_url = "https://pubmed.ncbi.nlm.nih.gov/_pow/solve"
+                        solve_payload = {
+                            "challenge_id": challenge_id,
+                            "nonce": str(nonce),
+                            "redirect_url": url
+                        }
+                        solve_headers = {
+                            "Content-Type": "application/json",
+                            "Referer": url,
+                            "Origin": "https://pubmed.ncbi.nlm.nih.gov"
+                        }
+                        solve_resp = await self.session.post(solve_url, json=solve_payload, headers=solve_headers)
+
+                        # Trích xuất cookie N_POW_Challenge từ session hoặc header
+                        pow_cookie = self.session.cookies.get("N_POW_Challenge")
+                        if not pow_cookie:
+                            import re
+                            c_match = re.search(r"N_POW_Challenge=([^;]+)", solve_resp.headers.get("set-cookie", ""))
+                            if c_match:
+                                pow_cookie = c_match.group(1)
+
+                        if pow_cookie:
+                            self._pubmed_cookies = f"N_POW_Challenge={pow_cookie}"
+                            retry_headers = custom_headers.copy() if custom_headers else {}
+                            retry_headers["Cookie"] = self._pubmed_cookies
+                            retry_resp = await self.session.get(url, headers=retry_headers)
+                            if retry_resp.status_code == 200:
+                                return 200, retry_resp.text or "", None
+                            return retry_resp.status_code, retry_resp.text or "", f"HTTP {retry_resp.status_code}"
 
                 if status_code == 200:
                     return 200, html, None
